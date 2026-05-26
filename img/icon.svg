@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0a0a0f"/>
+      <stop offset="100%" stop-color="#12122a"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#4da6ff"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- Map pin -->
+  <path d="M256 64C186 64 128 118 128 186c0 96 128 220 128 220s128-124 128-220c0-68-58-122-128-122z" fill="url(#accentGrad)" opacity="0.95"/>
+  <circle cx="256" cy="182" r="52" fill="#fff" opacity="0.95"/>
+  <circle cx="256" cy="182" r="26" fill="url(#accentGrad)"/>
+  <!-- Signal waves -->
+  <path d="M370 130c15 15 24 34 24 56" stroke="#4da6ff" stroke-width="8" stroke-linecap="round" opacity="0.5"/>
+  <path d="M392 98c28 28 46 64 46 104" stroke="#4da6ff" stroke-width="8" stroke-linecap="round" opacity="0.3"/>
+  <path d="M414 66c42 42 68 96 68 154" stroke="#4da6ff" stroke-width="8" stroke-linecap="round" opacity="0.15"/>
+</svg>
