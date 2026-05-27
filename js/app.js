@@ -249,6 +249,11 @@
     return bestPoint;
   }
 
+  /** Escape special regex characters for Overpass QL name~ operator */
+  function escapeOverpassRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   /** Format coordinates for display */
   function formatCoord(deg) {
     const d = Math.abs(deg);
@@ -335,22 +340,48 @@
     state.crossStreetPending = true;
     state.lastCrossStreetTime = now;
 
+    const curName = state.currentAddress && state.currentAddress.road
+      ? state.currentAddress.road.toLowerCase().trim() : '';
+
     try {
-      // Find ALL nearby named highways + ways that share nodes with any of them.
-      // This catches true intersections regardless of which road is returned first.
-      const query = `
-        [out:json][timeout:10];
-        (
-          way(around:35,${lat},${lng})[highway][name];
-        )->.allroads;
-        node(w.allroads)->.allnodes;
-        way(bn.allnodes)[highway][name]->.cross;
-        (
-          .allroads;
-          .cross;
-        );
-        out geom 80;
-      `.replace(/\s+/g, ' ').trim();
+      let query;
+
+      if (curName) {
+        // Name-based query: find ALL segments of the current road (by name)
+        // within 2km, then find all roads that share nodes with any segment.
+        // This catches intersections regardless of how far they are from the user's
+        // current position along the road.
+        const escaped = escapeOverpassRegex(curName);
+        query = `
+          [out:json][timeout:10];
+          (
+            way[name~"^${escaped}",i](around:2000,${lat},${lng})[highway];
+          )->.allroad;
+          node(w.allroad)->.rnodes;
+          way(bn.rnodes)[highway][name]->.cross;
+          (
+            .allroad;
+            .cross;
+          );
+          out geom 150;
+        `.replace(/\s+/g, ' ').trim();
+      } else {
+        // Geometry fallback: find nearby roads and their intersecting roads.
+        // Use a larger radius (100m) since node proximity can miss long segments.
+        query = `
+          [out:json][timeout:10];
+          (
+            way(around:100,${lat},${lng})[highway][name];
+          )->.allroads;
+          node(w.allroads)->.allnodes;
+          way(bn.allnodes)[highway][name]->.cross;
+          (
+            .allroads;
+            .cross;
+          );
+          out geom 150;
+        `.replace(/\s+/g, ' ').trim();
+      }
 
       const resp = await fetch('https://overpass-api.de/api/interpreter', {
         method: 'POST',
@@ -362,26 +393,36 @@
       const data = await resp.json();
       const elements = data.elements || [];
 
-      // Separate the current road from cross streets by matching Nominatim name
-      const curName = state.currentAddress && state.currentAddress.road
-        ? state.currentAddress.road.toLowerCase().trim() : '';
-
+      // Separate the current road from cross streets by matching Nominatim name.
+      // Collect ALL same-name segments — first becomes currentRoad, rest go to
+      // crossRoads so the merge loop can combine them into the full road geometry.
       let currentRoad = null;
       const crossRoads = [];
 
-      // First pass: name match (exact or contains) for identifying current road
       for (const el of elements) {
         if (el.type !== 'way' || !el.tags || !el.tags.name || !el.geometry || el.geometry.length < 2) continue;
         if (!curName) { crossRoads.push(el); continue; }
         const elName = el.tags.name.toLowerCase().trim();
-        if (elName === curName || elName.includes(curName) || curName.includes(elName)) {
-          currentRoad = el;
+        if (elName === curName || elName.startsWith(curName + ' ') || curName.startsWith(elName + ' ')) {
+          // Same road — keep all segments (first as currentRoad, rest preserved in crossRoads)
+          if (!currentRoad) {
+            currentRoad = el;
+          } else {
+            crossRoads.push(el);
+          }
         } else {
           crossRoads.push(el);
         }
       }
 
-      // If no name match, take the road geometrically closest to user as current road
+      // If we used the name-based query and found NO current road, the OSM name
+      // likely differs from Nominatim (e.g. "Mary Street" vs "Mary St").
+      // Don't try to salvage — fall back to geometry-based detection immediately.
+      if (curName && !currentRoad) {
+        return fallbackCrossStreets(lat, lng, heading);
+      }
+
+      // If no name match (geometry-based query), take the road closest to user
       if (!currentRoad && crossRoads.length > 0) {
         let bestDist = Infinity;
         for (const el of crossRoads) {
@@ -402,8 +443,26 @@
         return fallbackCrossStreets(lat, lng, heading);
       }
 
-      // Build current road polyline
-      const roadGeom = currentRoad.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+      // Build current road polyline (combine ALL matching segments for full road geometry)
+      let roadGeom = currentRoad.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+
+      // Merge ALL same-name segments into roadGeom to build the full road geometry.
+      // Uses the same strict matching as the first pass.
+      if (curName) {
+        const toMerge = [];
+        for (let i = crossRoads.length - 1; i >= 0; i--) {
+          const el = crossRoads[i];
+          if (!el.tags || !el.tags.name || !el.geometry) continue;
+          const elName = el.tags.name.toLowerCase().trim();
+          if (elName === curName || elName.startsWith(curName + ' ') || curName.startsWith(elName + ' ')) {
+            toMerge.push(el);
+            crossRoads.splice(i, 1);
+          }
+        }
+        for (const el of toMerge) {
+          roadGeom = roadGeom.concat(el.geometry.map(n => ({ lat: n.lat, lng: n.lon })));
+        }
+      }
 
       // For each cross street, find the intersection point (node closest to current road)
       const intersections = [];
