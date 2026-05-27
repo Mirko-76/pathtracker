@@ -13,6 +13,7 @@
     currentPos: null,          // { lat, lng, heading, speed, accuracy, altitude, timestamp }
     trackPoints: [],           // Array of { lat, lng, timestamp, speed }
     totalDistance: 0,          // km
+    lastHeading: null,         // Most recent heading for cross-street lookups
     lastGeocodeTime: 0,        // Throttle Nominatim
     lastCrossStreetTime: 0,    // Throttle Overpass
     currentAddress: null,      // { road, suburb, city, state, country }
@@ -214,6 +215,40 @@
     return diff > 180 ? 360 - diff : diff;
   }
 
+  /** Find the closest point on a line segment AB to point P (returns {lat, lng}) */
+  function closestPointOnSegment(p, a, b) {
+    const avgLat = (a.lat + b.lat) / 2;
+    const latScale = 111320;
+    const lngScale = 111320 * Math.cos(avgLat * Math.PI / 180);
+    const ax = a.lng * lngScale, ay = a.lat * latScale;
+    const bx = b.lng * lngScale, by = b.lat * latScale;
+    const px = p.lng * lngScale, py = p.lat * latScale;
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) return { lat: a.lat, lng: a.lng };
+    let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    return {
+      lat: a.lat + t * (b.lat - a.lat),
+      lng: a.lng + t * (b.lng - a.lng),
+    };
+  }
+
+  /** Find the closest point on a polyline to point P (returns {lat, lng}) */
+  function closestPointOnPolyline(p, polyline) {
+    let bestDist = Infinity;
+    let bestPoint = polyline[0];
+    for (let i = 0; i < polyline.length - 1; i++) {
+      const closest = closestPointOnSegment(p, polyline[i], polyline[i + 1]);
+      const dist = haversineKm(p.lat, p.lng, closest.lat, closest.lng);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPoint = closest;
+      }
+    }
+    return bestPoint;
+  }
+
   /** Format coordinates for display */
   function formatCoord(deg) {
     const d = Math.abs(deg);
@@ -269,6 +304,9 @@
           country: addr.country || null,
         };
         updateAddressUI();
+
+        // Immediately trigger cross-street lookup now that we have the road name
+        findCrossStreets(lat, lng, state.lastHeading);
       }
     } catch (err) {
       console.warn('Reverse geocode failed:', err.message);
@@ -293,16 +331,127 @@
     const now = Date.now();
     if (now - state.lastCrossStreetTime < 5000) return; // Throttle: max 1 per 5s
     if (state.crossStreetPending) return;
-    if (!state.currentAddress || !state.currentAddress.road) return;
 
     state.crossStreetPending = true;
     state.lastCrossStreetTime = now;
 
     try {
+      // Find ALL nearby named highways + ways that share nodes with any of them.
+      // This catches true intersections regardless of which road is returned first.
       const query = `
         [out:json][timeout:10];
-        way(around:40,${lat},${lng})[highway~"^(primary|secondary|tertiary|residential|unclassified|living_street|service|pedestrian)$"];
-        out tags center 15;
+        (
+          way(around:35,${lat},${lng})[highway][name];
+        )->.allroads;
+        node(w.allroads)->.allnodes;
+        way(bn.allnodes)[highway][name]->.cross;
+        (
+          .allroads;
+          .cross;
+        );
+        out geom 80;
+      `.replace(/\s+/g, ' ').trim();
+
+      const resp = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'data=' + encodeURIComponent(query),
+      });
+
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const elements = data.elements || [];
+
+      // Separate the current road from cross streets by matching Nominatim name
+      const curName = state.currentAddress && state.currentAddress.road
+        ? state.currentAddress.road.toLowerCase().trim() : '';
+
+      let currentRoad = null;
+      const crossRoads = [];
+
+      // First pass: name match (exact or contains) for identifying current road
+      for (const el of elements) {
+        if (el.type !== 'way' || !el.tags || !el.tags.name || !el.geometry || el.geometry.length < 2) continue;
+        if (!curName) { crossRoads.push(el); continue; }
+        const elName = el.tags.name.toLowerCase().trim();
+        if (elName === curName || elName.includes(curName) || curName.includes(elName)) {
+          currentRoad = el;
+        } else {
+          crossRoads.push(el);
+        }
+      }
+
+      // If no name match, take the road geometrically closest to user as current road
+      if (!currentRoad && crossRoads.length > 0) {
+        let bestDist = Infinity;
+        for (const el of crossRoads) {
+          const cp = closestPointOnPolyline({ lat, lng }, el.geometry.map(n => ({ lat: n.lat, lng: n.lon })));
+          const dist = haversineKm(lat, lng, cp.lat, cp.lng);
+          if (dist < bestDist) {
+            bestDist = dist;
+            currentRoad = el;
+          }
+        }
+        // Remove the chosen road from crossRoads
+        const idx = crossRoads.indexOf(currentRoad);
+        if (idx >= 0) crossRoads.splice(idx, 1);
+      }
+
+      if (!currentRoad) {
+        // Can't determine current road at all — fall back to nearby streets
+        return fallbackCrossStreets(lat, lng, heading);
+      }
+
+      // Build current road polyline
+      const roadGeom = currentRoad.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+
+      // For each cross street, find the intersection point (node closest to current road)
+      const intersections = [];
+      for (const street of crossRoads) {
+        if (!street.geometry || street.geometry.length < 2) continue;
+        let bestNode = null;
+        let bestDist = Infinity;
+        for (const node of street.geometry) {
+          const closestPt = closestPointOnPolyline(
+            { lat: node.lat, lng: node.lon },
+            roadGeom
+          );
+          const dist = haversineKm(node.lat, node.lon, closestPt.lat, closestPt.lng);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestNode = { lat: node.lat, lng: node.lon };
+          }
+        }
+        // Accept if the intersection node is within 35m of the current road
+        if (bestNode && bestDist < 0.035) {
+          intersections.push({
+            name: street.tags.name,
+            lat: bestNode.lat,
+            lng: bestNode.lng,
+          });
+        }
+      }
+
+      if (intersections.length === 0) {
+        return fallbackCrossStreets(lat, lng, heading);
+      }
+
+      updateCrossStreetsUI(intersections, heading);
+      state.crossStreetPending = false;
+    } catch (err) {
+      state.crossStreetPending = false;
+      console.warn('Cross street query failed:', err.message);
+    }
+  }
+
+  /** Fallback: query nearby highways and classify by bearing (wider radius) */
+  async function fallbackCrossStreets(lat, lng, heading) {
+    state.crossStreetPending = true;
+    try {
+      const query = `
+        [out:json][timeout:8];
+        way(around:80,${lat},${lng})[highway~"^(primary|secondary|tertiary|residential|unclassified|living_street|service|pedestrian)$"];
+        out tags center 20;
       `.replace(/\s+/g, ' ').trim();
 
       const resp = await fetch('https://overpass-api.de/api/interpreter', {
@@ -314,27 +463,25 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
 
-      const currentRoad = state.currentAddress.road.toLowerCase().trim();
+      const curName = state.currentAddress && state.currentAddress.road
+        ? state.currentAddress.road.toLowerCase().trim() : '';
       const streets = [];
 
       for (const el of data.elements) {
         if (!el.tags || !el.tags.name) continue;
         const name = el.tags.name.trim();
-        // Skip if same as current road
-        if (name.toLowerCase() === currentRoad) continue;
-        // Skip duplicates
+        if (curName && name.toLowerCase() === curName) continue;
         if (streets.some(s => s.name.toLowerCase() === name.toLowerCase())) continue;
-
         streets.push({
           name,
-          lat: el.center ? el.center.lat : el.bounds.minlat,
-          lng: el.center ? el.center.lon : el.bounds.minlon,
+          lat: el.center ? el.center.lat : (el.bounds ? el.bounds.minlat : el.lat),
+          lng: el.center ? el.center.lon : (el.bounds ? el.bounds.minlon : el.lon),
         });
       }
 
       updateCrossStreetsUI(streets, heading);
     } catch (err) {
-      console.warn('Cross street query failed:', err.message);
+      console.warn('Fallback cross street query failed:', err.message);
     } finally {
       state.crossStreetPending = false;
     }
@@ -342,38 +489,48 @@
 
   function updateCrossStreetsUI(streets, heading) {
     if (!state.currentPos) return;
-    if (heading == null || heading < 0) {
-      // No heading — just show nearest cross streets
-      const names = streets.slice(0, 2).map(s => s.name);
-      crossBehind.textContent = names[0] || '—';
-      crossAhead.textContent = names[1] || '—';
+    if (!streets || streets.length === 0) {
+      crossBehind.textContent = '—';
+      crossAhead.textContent = '—';
       return;
     }
 
-    // Classify streets as ahead (+/-90° of heading) or behind
+    if (heading == null || heading < 0) {
+      // No heading — show two nearest streets
+      streets.sort((a, b) => {
+        const distA = haversineKm(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng);
+        const distB = haversineKm(state.currentPos.lat, state.currentPos.lng, b.lat, b.lng);
+        return distA - distB;
+      });
+      crossBehind.textContent = streets[0] ? streets[0].name : '—';
+      crossAhead.textContent = streets[1] ? streets[1].name : '—';
+      return;
+    }
+
+    // Classify streets as ahead (+/-90° of heading) or behind (>90°)
     const ahead = [];
     const behind = [];
 
     for (const s of streets) {
       const b = bearingDeg(state.currentPos.lat, state.currentPos.lng, s.lat, s.lng);
       const diff = bearingDiff(heading, b);
-      if (diff <= 100) {
+      if (diff < 90) {
         ahead.push(s);
       } else {
         behind.push(s);
       }
     }
 
-    // Sort by distance (approximate by bearing diff from heading)
+    // Sort by distance from current position
     ahead.sort((a, b) => {
-      const diffA = bearingDiff(heading, bearingDeg(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng));
-      const diffB = bearingDiff(heading, bearingDeg(state.currentPos.lat, state.currentPos.lng, b.lat, b.lng));
-      return diffA - diffB;
+      const distA = haversineKm(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng);
+      const distB = haversineKm(state.currentPos.lat, state.currentPos.lng, b.lat, b.lng);
+      return distA - distB;
     });
     behind.sort((a, b) => {
-      const diffA = bearingDiff((heading + 180) % 360, bearingDeg(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng));
-      const diffB = bearingDiff((heading + 180) % 360, bearingDeg(state.currentPos.lat, state.currentPos.lng, b.lat, b.lng));
-      return diffA - diffB;
+      const distA = haversineKm(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng);
+      const distB = haversineKm(state.currentPos.lat, state.currentPos.lng, b.lat, b.lng);
+      return distA - distB;
     });
 
     crossBehind.textContent = behind[0] ? behind[0].name : '—';
@@ -481,6 +638,9 @@
       heading = bearingDeg(prev.lat, prev.lng, pos.lat, pos.lng);
     }
 
+    // Store latest heading so reverse geocode can trigger cross-street lookup
+    state.lastHeading = heading;
+
     state.currentPos = pos;
 
     // On first fix, center map
@@ -491,11 +651,9 @@
     updateMap(pos);
     updateUI(pos);
 
-    // Reverse geocode (throttled internally)
+    // Reverse geocode (throttled internally) — also triggers cross-street lookup
+    // once the road name is resolved, so cross streets always have context
     reverseGeocode(pos.lat, pos.lng);
-
-    // Cross streets — pass computed heading for front/back classification
-    findCrossStreets(pos.lat, pos.lng, heading);
   }
 
   function onPositionError(err) {
@@ -557,6 +715,7 @@
 
     state.tracking = false;
     state.currentPos = null;
+    state.lastHeading = null;
     updateTrackingUI();
   }
 
@@ -609,6 +768,7 @@
     state.totalDistance = 0;
     state.pendingLatLngs = [];
     state.currentAddress = null;
+    state.lastHeading = null;
     state.lastSaveTime = 0;
     state.lastRenderTime = 0;
     trackLine.setLatLngs([]);
