@@ -28,6 +28,9 @@
   const MAX_TRACK_POINTS = 5000;
   const DECIMATED_POINTS = 2500;
 
+  // Only proper streets and roads — exclude cycleways, footways, paths, etc.
+  const ROAD_HIGHWAY_FILTER = '[highway~"^(motorway|trunk|primary|secondary|tertiary|residential|unclassified|living_street|service)$]"]';
+
   // Load saved track from localStorage
   function loadSavedTrack() {
     try {
@@ -355,10 +358,10 @@
         query = `
           [out:json][timeout:10];
           (
-            way[name~"^${escaped}",i](around:2000,${lat},${lng})[highway];
+            way[name~"^${escaped}",i](around:2000,${lat},${lng})${ROAD_HIGHWAY_FILTER};
           )->.allroad;
           node(w.allroad)->.rnodes;
-          way(bn.rnodes)[highway][name]->.cross;
+          way(bn.rnodes)${ROAD_HIGHWAY_FILTER}[name]->.cross;
           (
             .allroad;
             .cross;
@@ -371,10 +374,10 @@
         query = `
           [out:json][timeout:10];
           (
-            way(around:100,${lat},${lng})[highway][name];
+            way(around:100,${lat},${lng})${ROAD_HIGHWAY_FILTER}[name];
           )->.allroads;
           node(w.allroads)->.allnodes;
-          way(bn.allnodes)[highway][name]->.cross;
+          way(bn.allnodes)${ROAD_HIGHWAY_FILTER}[name]->.cross;
           (
             .allroads;
             .cross;
@@ -419,6 +422,8 @@
       // likely differs from Nominatim (e.g. "Mary Street" vs "Mary St").
       // Don't try to salvage — fall back to geometry-based detection immediately.
       if (curName && !currentRoad) {
+        // Street confirmed by Nominatim but OSM name doesn't match.
+        // Try the geometry-based fallback as a last resort.
         return fallbackCrossStreets(lat, lng, heading);
       }
 
@@ -492,6 +497,14 @@
       }
 
       if (intersections.length === 0) {
+        // Street confirmed but no road intersections found — show dashes,
+        // don't fall back to guessing nearby streets.
+        if (curName) {
+          crossBehind.textContent = '—';
+          crossAhead.textContent = '—';
+          state.crossStreetPending = false;
+          return;
+        }
         return fallbackCrossStreets(lat, lng, heading);
       }
 
@@ -509,7 +522,7 @@
     try {
       const query = `
         [out:json][timeout:8];
-        way(around:80,${lat},${lng})[highway~"^(primary|secondary|tertiary|residential|unclassified|living_street|service|pedestrian)$"];
+        way(around:80,${lat},${lng})${ROAD_HIGHWAY_FILTER};
         out tags center 20;
       `.replace(/\s+/g, ' ').trim();
 
