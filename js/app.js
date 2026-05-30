@@ -22,6 +22,8 @@
     lastSaveTime: 0,           // Throttle localStorage writes
     lastRenderTime: 0,         // Throttle map render updates
     pendingLatLngs: [],        // Batched lat/lngs for incremental polyline update
+    mapTheme: 'dark',          // 'dark' or 'light'
+    moveMode: false,           // Manual position drag mode
   };
 
   // Track point limits to avoid unbounded growth
@@ -131,10 +133,15 @@
   const statPoints = $('#stat-points');
   const statAccuracy = $('#stat-accuracy');
   const toastContainer = $('#toast-container');
+  const btnTheme = $('#btn-theme');
+  const btnMove = $('#btn-move');
+  const moveBadge = $('#move-badge');
+  const btnZoomIn = $('#btn-zoom-in');
+  const btnZoomOut = $('#btn-zoom-out');
 
   // ─── Leaflet Map Setup ──────────────────────
   const map = L.map('map', {
-    zoomControl: true,
+    zoomControl: false,
     attributionControl: false,
     zoom: 16,
     center: [0, 0],
@@ -143,12 +150,12 @@
   });
 
   // Dark basemap tile layer
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  const darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
     subdomains: 'abcd',
-  }).addTo(map);
+  });
 
-  // Bright tile layer as fallback
+  // Light (day) tile layer
   const lightLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '© OpenStreetMap contributors',
@@ -175,7 +182,110 @@
   const positionMarker = L.marker([0, 0], {
     icon: pulseIcon,
     zIndexOffset: 1000,
+    draggable: false,
   }).addTo(map);
+
+  // Move-mode marker (amber dot) — alternate icon
+  const moveIcon = L.divIcon({
+    className: '',
+    html: '<div class="pulse-marker move-mode"><div class="pulse-ring"></div><div class="pulse-dot"></div></div>',
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
+  });
+
+  // Handle marker drag end — update position info for dropped location.
+  // Bypass API throttles so manual drags always fetch fresh address + cross streets.
+  positionMarker.on('dragend', function (e) {
+    const ll = e.target.getLatLng();
+
+    // Compute heading from drag direction (previous marker pos → drop point)
+    const prevPos = state.currentPos;
+    const newHeading = prevPos
+      ? bearingDeg(prevPos.lat, prevPos.lng, ll.lat, ll.lng)
+      : state.lastHeading;  // fall back to GPS heading if no previous drag position
+
+    const pos = {
+      lat: ll.lat,
+      lng: ll.lng,
+      heading: newHeading,
+      speed: null,
+      accuracy: null,
+      altitude: null,
+      timestamp: Date.now(),
+    };
+    state.currentPos = pos;
+    state.lastHeading = newHeading;
+    updateUI(pos);
+
+    // Reset throttle timers + pending flags so the manual drag always triggers fresh lookups
+    state.lastGeocodeTime = 0;
+    state.lastCrossStreetTime = 0;
+    state.geocodePending = false;
+    state.crossStreetPending = false;
+    reverseGeocode(pos.lat, pos.lng);
+  });
+
+  // ─── Move Mode (Manual Position Drag) ──────
+  function toggleMoveMode() {
+    state.moveMode = !state.moveMode;
+
+    if (state.moveMode) {
+      // Enable dragging
+      positionMarker.setIcon(moveIcon);
+      positionMarker.dragging.enable();
+      btnMove.classList.add('move-active');
+      btnMove.setAttribute('title', 'Disable manual position drag');
+      moveBadge.classList.remove('hidden');
+      showToast('Move mode on — drag the marker to explore');
+    } else {
+      // Disable dragging — GPS resumes controlling marker
+      positionMarker.setIcon(pulseIcon);
+      positionMarker.dragging.disable();
+      btnMove.classList.remove('move-active');
+      btnMove.setAttribute('title', 'Enable manual position drag');
+      moveBadge.classList.add('hidden');
+
+      // Snap marker back to last GPS position
+      if (state.currentPos) {
+        positionMarker.setLatLng([state.currentPos.lat, state.currentPos.lng]);
+        updateUI(state.currentPos);
+        reverseGeocode(state.currentPos.lat, state.currentPos.lng);
+      }
+      showToast('Move mode off — GPS tracking resumed');
+    }
+  }
+
+  // ─── Theme Toggle ──────────────────────────
+  function loadTheme() {
+    try {
+      const saved = localStorage.getItem('pathtracker_theme');
+      if (saved === 'light' || saved === 'dark') {
+        state.mapTheme = saved;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function applyTheme() {
+    if (state.mapTheme === 'light') {
+      map.removeLayer(darkLayer);
+      map.addLayer(lightLayer);
+      btnTheme.classList.add('theme-day');
+      btnTheme.setAttribute('title', 'Switch to dark map');
+    } else {
+      map.removeLayer(lightLayer);
+      map.addLayer(darkLayer);
+      btnTheme.classList.remove('theme-day');
+      btnTheme.setAttribute('title', 'Switch to light map');
+    }
+  }
+
+  function toggleTheme() {
+    state.mapTheme = state.mapTheme === 'dark' ? 'light' : 'dark';
+    applyTheme();
+    try {
+      localStorage.setItem('pathtracker_theme', state.mapTheme);
+    } catch (e) { /* ignore */ }
+  }
 
   // ─── Helper Functions ────────────────────────
 
@@ -252,11 +362,6 @@
     return bestPoint;
   }
 
-  /** Escape special regex characters for Overpass QL name~ operator */
-  function escapeOverpassRegex(str) {
-    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-
   /** Format coordinates for display */
   function formatCoord(deg) {
     const d = Math.abs(deg);
@@ -291,6 +396,7 @@
     if (now - state.lastGeocodeTime < 2000) return; // Throttle: max 1 req per 2s
     if (state.geocodePending) return;
 
+    const requestTime = now;  // Track this specific request to avoid stale responses
     state.geocodePending = true;
     state.lastGeocodeTime = now;
 
@@ -300,6 +406,9 @@
         headers: { 'User-Agent': 'PathTracker-PWA/1.0' },
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      // If a newer request has been made (e.g. another drag), discard this stale response
+      if (state.lastGeocodeTime !== requestTime) return;
 
       const data = await resp.json();
       if (data && data.address) {
@@ -343,49 +452,25 @@
     state.crossStreetPending = true;
     state.lastCrossStreetTime = now;
 
-    const curName = state.currentAddress && state.currentAddress.road
-      ? state.currentAddress.road.toLowerCase().trim() : '';
-
     try {
-      let query;
+      // Always use geometry-based query — find nearby named roads (150m radius)
+      // and their intersecting roads via shared nodes.
+      // Avoids brittle name matching between Nominatim and OSM (e.g. "St" vs "Street").
+      const query = `
+        [out:json][timeout:10];
+        (
+          way(around:150,${lat},${lng})${ROAD_HIGHWAY_FILTER}[name];
+        )->.allroads;
+        node(w.allroads)->.allnodes;
+        way(bn.allnodes)${ROAD_HIGHWAY_FILTER}[name](around:300,${lat},${lng})->.cross;
+        (
+          .allroads;
+          .cross;
+        );
+        out geom 150;
+      `.replace(/\s+/g, ' ').trim();
 
-      if (curName) {
-        // Name-based query: find ALL segments of the current road (by name)
-        // within 2km, then find all roads that share nodes with any segment.
-        // This catches intersections regardless of how far they are from the user's
-        // current position along the road.
-        const escaped = escapeOverpassRegex(curName);
-        query = `
-          [out:json][timeout:10];
-          (
-            way[name~"^${escaped}",i](around:2000,${lat},${lng})${ROAD_HIGHWAY_FILTER};
-          )->.allroad;
-          node(w.allroad)->.rnodes;
-          way(bn.rnodes)${ROAD_HIGHWAY_FILTER}[name]->.cross;
-          (
-            .allroad;
-            .cross;
-          );
-          out geom 150;
-        `.replace(/\s+/g, ' ').trim();
-      } else {
-        // Geometry fallback: find nearby roads and their intersecting roads.
-        // Use a larger radius (100m) since node proximity can miss long segments.
-        query = `
-          [out:json][timeout:10];
-          (
-            way(around:100,${lat},${lng})${ROAD_HIGHWAY_FILTER}[name];
-          )->.allroads;
-          node(w.allroads)->.allnodes;
-          way(bn.allnodes)${ROAD_HIGHWAY_FILTER}[name]->.cross;
-          (
-            .allroads;
-            .cross;
-          );
-          out geom 150;
-        `.replace(/\s+/g, ' ').trim();
-      }
-
+      console.log('[CrossStreets] Querying Overpass...', { lat, lng, heading });
       const resp = await fetch('https://overpass-api.de/api/interpreter', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -395,77 +480,49 @@
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const elements = data.elements || [];
+      console.log('[CrossStreets] Overpass returned', elements.length, 'elements');
 
-      // Separate the current road from cross streets by matching Nominatim name.
-      // Collect ALL same-name segments — first becomes currentRoad, rest go to
-      // crossRoads so the merge loop can combine them into the full road geometry.
-      let currentRoad = null;
-      const crossRoads = [];
-
+      // Collect all named roads with geometry
+      const allRoads = [];
       for (const el of elements) {
         if (el.type !== 'way' || !el.tags || !el.tags.name || !el.geometry || el.geometry.length < 2) continue;
-        if (!curName) { crossRoads.push(el); continue; }
-        const elName = el.tags.name.toLowerCase().trim();
-        if (elName === curName || elName.startsWith(curName + ' ') || curName.startsWith(elName + ' ')) {
-          // Same road — keep all segments (first as currentRoad, rest preserved in crossRoads)
-          if (!currentRoad) {
-            currentRoad = el;
-          } else {
-            crossRoads.push(el);
-          }
+        allRoads.push(el);
+      }
+
+      if (allRoads.length === 0) {
+        console.warn('[CrossStreets] No named roads with geometry found');
+        crossBehind.textContent = '—';
+        crossAhead.textContent = '—';
+        state.crossStreetPending = false;
+        return;
+      }
+
+      // Find the current road: the one closest to the pin position
+      let currentRoad = null;
+      let bestDist = Infinity;
+      for (const el of allRoads) {
+        const geom = el.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+        const cp = closestPointOnPolyline({ lat, lng }, geom);
+        const dist = haversineKm(lat, lng, cp.lat, cp.lng);
+        if (dist < bestDist) {
+          bestDist = dist;
+          currentRoad = el;
+        }
+      }
+
+      // Deduplicate: combine all segments of the current road (same name) into roadGeom
+      const curName = (currentRoad.tags.name || '').toLowerCase().trim();
+      let roadGeom = currentRoad.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
+      const crossRoads = [];
+
+      for (const el of allRoads) {
+        if (el === currentRoad) continue;
+        const elName = (el.tags.name || '').toLowerCase().trim();
+        if (curName && (elName === curName || elName.startsWith(curName + ' ') || curName.startsWith(elName + ' '))) {
+          // Same road, different segment — merge into road geometry
+          roadGeom = roadGeom.concat(el.geometry.map(n => ({ lat: n.lat, lng: n.lon })));
         } else {
           crossRoads.push(el);
-        }
-      }
-
-      // If we used the name-based query and found NO current road, the OSM name
-      // likely differs from Nominatim (e.g. "Mary Street" vs "Mary St").
-      // Don't try to salvage — fall back to geometry-based detection immediately.
-      if (curName && !currentRoad) {
-        // Street confirmed by Nominatim but OSM name doesn't match.
-        // Try the geometry-based fallback as a last resort.
-        return fallbackCrossStreets(lat, lng, heading);
-      }
-
-      // If no name match (geometry-based query), take the road closest to user
-      if (!currentRoad && crossRoads.length > 0) {
-        let bestDist = Infinity;
-        for (const el of crossRoads) {
-          const cp = closestPointOnPolyline({ lat, lng }, el.geometry.map(n => ({ lat: n.lat, lng: n.lon })));
-          const dist = haversineKm(lat, lng, cp.lat, cp.lng);
-          if (dist < bestDist) {
-            bestDist = dist;
-            currentRoad = el;
-          }
-        }
-        // Remove the chosen road from crossRoads
-        const idx = crossRoads.indexOf(currentRoad);
-        if (idx >= 0) crossRoads.splice(idx, 1);
-      }
-
-      if (!currentRoad) {
-        // Can't determine current road at all — fall back to nearby streets
-        return fallbackCrossStreets(lat, lng, heading);
-      }
-
-      // Build current road polyline (combine ALL matching segments for full road geometry)
-      let roadGeom = currentRoad.geometry.map(n => ({ lat: n.lat, lng: n.lon }));
-
-      // Merge ALL same-name segments into roadGeom to build the full road geometry.
-      // Uses the same strict matching as the first pass.
-      if (curName) {
-        const toMerge = [];
-        for (let i = crossRoads.length - 1; i >= 0; i--) {
-          const el = crossRoads[i];
-          if (!el.tags || !el.tags.name || !el.geometry) continue;
-          const elName = el.tags.name.toLowerCase().trim();
-          if (elName === curName || elName.startsWith(curName + ' ') || curName.startsWith(elName + ' ')) {
-            toMerge.push(el);
-            crossRoads.splice(i, 1);
-          }
-        }
-        for (const el of toMerge) {
-          roadGeom = roadGeom.concat(el.geometry.map(n => ({ lat: n.lat, lng: n.lon })));
         }
       }
 
@@ -497,22 +554,21 @@
       }
 
       if (intersections.length === 0) {
-        // Street confirmed but no road intersections found — show dashes,
-        // don't fall back to guessing nearby streets.
-        if (curName) {
-          crossBehind.textContent = '—';
-          crossAhead.textContent = '—';
-          state.crossStreetPending = false;
-          return;
-        }
-        return fallbackCrossStreets(lat, lng, heading);
+        console.warn('[CrossStreets] No intersections found —', crossRoads.length, 'cross roads but none within 35m of current road');
+        crossBehind.textContent = '—';
+        crossAhead.textContent = '—';
+        state.crossStreetPending = false;
+        return;
       }
 
+      console.log('[CrossStreets] Found', intersections.length, 'intersections:', intersections.map(s => s.name));
       updateCrossStreetsUI(intersections, heading);
       state.crossStreetPending = false;
     } catch (err) {
+      console.error('[CrossStreets] Query FAILED:', err.message, err);
+      crossBehind.textContent = '—';
+      crossAhead.textContent = '—';
       state.crossStreetPending = false;
-      console.warn('Cross street query failed:', err.message);
     }
   }
 
@@ -553,6 +609,8 @@
 
       updateCrossStreetsUI(streets, heading);
     } catch (err) {
+      crossBehind.textContent = '—';
+      crossAhead.textContent = '—';
       console.warn('Fallback cross street query failed:', err.message);
     } finally {
       state.crossStreetPending = false;
@@ -560,7 +618,10 @@
   }
 
   function updateCrossStreetsUI(streets, heading) {
-    if (!state.currentPos) return;
+    if (!state.currentPos) {
+      console.warn('[CrossStreetsUI] No currentPos — bailing');
+      return;
+    }
     if (!streets || streets.length === 0) {
       crossBehind.textContent = '—';
       crossAhead.textContent = '—';
@@ -568,6 +629,7 @@
     }
 
     if (heading == null || heading < 0) {
+      console.log('[CrossStreetsUI] No heading — showing two nearest streets');
       // No heading — show two nearest streets
       streets.sort((a, b) => {
         const distA = haversineKm(state.currentPos.lat, state.currentPos.lng, a.lat, a.lng);
@@ -605,6 +667,7 @@
       return distA - distB;
     });
 
+    console.log('[CrossStreetsUI] heading:', heading, '| behind:', behind.map(s => s.name), '| ahead:', ahead.map(s => s.name));
     crossBehind.textContent = behind[0] ? behind[0].name : '—';
     crossAhead.textContent = ahead[0] ? ahead[0].name : '—';
   }
@@ -633,10 +696,9 @@
     }
   }
 
-  function updateMap(pos) {
-    // Update marker position
-    positionMarker.setLatLng([pos.lat, pos.lng]);
-
+  /** Add a GPS point to the track without updating the marker position.
+   *  Used during move mode so the track continues while the user drags. */
+  function addTrackPoint(pos) {
     // Add to track
     state.trackPoints.push({
       lat: pos.lat,
@@ -655,25 +717,20 @@
     if (state.trackPoints.length > MAX_TRACK_POINTS) {
       const lastPoint = state.trackPoints[state.trackPoints.length - 1];
       state.trackPoints = decimatePoints(state.trackPoints, 0.0001);
-      // Ensure we don't exceed the target after decimation
       if (state.trackPoints.length > DECIMATED_POINTS) {
         const step = Math.ceil(state.trackPoints.length / DECIMATED_POINTS);
         state.trackPoints = state.trackPoints.filter((_, i) => i % step === 0);
-        // Always keep the last (current) point
         if (state.trackPoints[state.trackPoints.length - 1] !== lastPoint) {
           state.trackPoints.push(lastPoint);
         }
       }
-      // Recalculate distance and full polyline rebuild after decimation
       state.totalDistance = calculateTotalDistance(state.trackPoints);
       state.pendingLatLngs = [];
       trackLine.setLatLngs(state.trackPoints.map(p => [p.lat, p.lng]));
     } else {
-      // Incremental update: batch points and update every ~300ms
       state.pendingLatLngs.push([pos.lat, pos.lng]);
       const now = Date.now();
       if (now - state.lastRenderTime > 300) {
-        // Add batched points to polyline
         for (const ll of state.pendingLatLngs) {
           trackLine.addLatLng(ll);
         }
@@ -688,6 +745,13 @@
       state.lastSaveTime = nowSave;
       saveTrack();
     }
+  }
+
+  function updateMap(pos) {
+    // Update marker position
+    positionMarker.setLatLng([pos.lat, pos.lng]);
+
+    addTrackPoint(pos);
   }
 
   // ─── GPS Position Handler ───────────────────
@@ -710,15 +774,21 @@
       heading = bearingDeg(prev.lat, prev.lng, pos.lat, pos.lng);
     }
 
-    // Store latest heading so reverse geocode can trigger cross-street lookup
-    state.lastHeading = heading;
-
-    state.currentPos = pos;
-
     // On first fix, center map
     if (state.trackPoints.length === 0) {
       map.setView([pos.lat, pos.lng], 17, { animate: true });
     }
+
+    // If in move mode, collect track data but don't update position/heading state
+    // (the user is manually dragging the marker; don't let GPS overwrite it)
+    if (state.moveMode) {
+      addTrackPoint(pos);
+      return;
+    }
+
+    // Update position state only when NOT in move mode
+    state.lastHeading = heading;
+    state.currentPos = pos;
 
     updateMap(pos);
     updateUI(pos);
@@ -856,6 +926,7 @@
     speedValue.textContent = '—';
     statDistance.textContent = '0.00 km';
     statPoints.textContent = '0';
+    statAccuracy.textContent = '—';
 
     showToast('Path cleared.');
   }
@@ -948,6 +1019,10 @@
   btnClear.addEventListener('click', clearPath);
   btnShare.addEventListener('click', shareTrack);
   btnPermission.addEventListener('click', requestPermission);
+  btnTheme.addEventListener('click', toggleTheme);
+  btnMove.addEventListener('click', toggleMoveMode);
+  btnZoomIn.addEventListener('click', () => map.zoomIn());
+  btnZoomOut.addEventListener('click', () => map.zoomOut());
 
   // ─── Keyboard Shortcuts ─────────────────────
   document.addEventListener('keydown', (e) => {
@@ -961,11 +1036,26 @@
         e.preventDefault();
         centerOnMe();
         break;
+      case 'm':
+        e.preventDefault();
+        toggleMoveMode();
+        break;
     }
   });
 
   // ─── Initialization ─────────────────────────
   function init() {
+    // Load saved theme preference
+    loadTheme();
+
+    // Add the initial tile layer based on saved preference
+    if (state.mapTheme === 'dark') {
+      darkLayer.addTo(map);
+    } else {
+      lightLayer.addTo(map);
+    }
+    applyTheme();
+
     // Register service worker for PWA
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js').catch((err) => {

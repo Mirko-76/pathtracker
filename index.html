@@ -39,6 +39,43 @@
         <span class="brand-text">PathTracker</span>
       </div>
       <div class="top-controls">
+        <button id="btn-zoom-in" class="icon-btn" title="Zoom in" aria-label="Zoom in">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            <line x1="11" y1="8" x2="11" y2="14"></line>
+            <line x1="8" y1="11" x2="14" y2="11"></line>
+          </svg>
+        </button>
+        <button id="btn-zoom-out" class="icon-btn" title="Zoom out" aria-label="Zoom out">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            <line x1="8" y1="11" x2="14" y2="11"></line>
+          </svg>
+        </button>
+        <button id="btn-move" class="icon-btn" title="Enable manual position drag" aria-label="Enable manual position drag">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 9l-3 3 3 3"></path>
+            <path d="M9 5l3-3 3 3"></path>
+            <path d="M15 19l-3 3-3-3"></path>
+            <path d="M19 9l3 3-3 3"></path>
+            <circle cx="12" cy="12" r="2"></circle>
+          </svg>
+        </button>
+        <button id="btn-theme" class="icon-btn" title="Toggle day/night map" aria-label="Toggle day/night map">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="5"></circle>
+            <line x1="12" y1="1" x2="12" y2="3"></line>
+            <line x1="12" y1="21" x2="12" y2="23"></line>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+            <line x1="1" y1="12" x2="3" y2="12"></line>
+            <line x1="21" y1="12" x2="23" y2="12"></line>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+          </svg>
+        </button>
         <button id="btn-center" class="icon-btn" title="Center on my location" aria-label="Center on my location">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
@@ -58,6 +95,9 @@
 
   <!-- Tracking Status Indicator -->
   <div id="tracking-badge" class="tracking-badge paused">● Paused</div>
+
+  <!-- Move Mode Indicator -->
+  <div id="move-badge" class="move-badge hidden">✋ Manual Position</div>
 
   <!-- Bottom Panel -->
   <div id="bottom-panel" class="bottom-panel">
